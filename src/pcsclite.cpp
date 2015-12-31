@@ -53,13 +53,16 @@ PCSCLite::PCSCLite(): m_card_context(0),
 PCSCLite::~PCSCLite() {
 
     if (m_status_thread) {
-        int ret = uv_thread_join(&m_status_thread);
-        assert(ret == 0);
+        SCardCancel(m_card_context);
+        assert(uv_thread_join(&m_status_thread) == 0);
     }
 
     if (m_card_context) {
         SCardReleaseContext(m_card_context);
     }
+
+    uv_cond_destroy(&m_cond);
+    uv_mutex_destroy(&m_mutex);
 }
 
 NAN_METHOD(PCSCLite::New) {
@@ -96,23 +99,28 @@ NAN_METHOD(PCSCLite::Close) {
 
     LONG result = SCARD_S_SUCCESS;
     if (obj->m_pnp) {
-        uv_mutex_lock(&obj->m_mutex);
-        if (obj->m_state == 0) {
-            obj->m_state = 1;
-            do {
-                result = SCardCancel(obj->m_card_context);
-            } while (uv_cond_timedwait(&obj->m_cond, &obj->m_mutex, 10000000) != 0);
-        }
+        if (obj->m_status_thread) {
+            uv_mutex_lock(&obj->m_mutex);
+            if (obj->m_state == 0) {
+                int ret;
+                int times = 0;
+                obj->m_state = 1;
+                do {
+                    result = SCardCancel(obj->m_card_context);
+                    ret = uv_cond_timedwait(&obj->m_cond, &obj->m_mutex, 10000000);
+                } while ((ret != 0) && (++ times < 5));
+            }
 
-        uv_mutex_unlock(&obj->m_mutex);
-        uv_mutex_destroy(&obj->m_mutex);
-        uv_cond_destroy(&obj->m_cond);
+            uv_mutex_unlock(&obj->m_mutex);
+        }
     } else {
         obj->m_state = 1;
     }
 
-    assert(uv_thread_join(&obj->m_status_thread) == 0);
-    obj->m_status_thread = 0;
+    if (obj->m_status_thread) {
+        assert(uv_thread_join(&obj->m_status_thread) == 0);
+        obj->m_status_thread = 0;
+    }
 
     info.GetReturnValue().Set(Nan::New<Number>(result));
 }
@@ -124,12 +132,10 @@ void PCSCLite::HandleReaderStatusChange(uv_async_t *handle, int status) {
     AsyncBaton* async_baton = static_cast<AsyncBaton*>(handle->data);
     AsyncResult* ar = async_baton->async_result;
 
-    if (ar->do_exit) {
-        uv_close(reinterpret_cast<uv_handle_t*>(&async_baton->async), CloseCallback); // necessary otherwise UV will block
-        return;
-    }
-
-    if ((ar->result == SCARD_S_SUCCESS) || (ar->result == (LONG)SCARD_E_NO_READERS_AVAILABLE)) {
+    if (async_baton->pcsclite->m_state == 1) {
+        // Swallow events : Listening thread was cancelled by user.
+    } else if ((ar->result == SCARD_S_SUCCESS) ||
+               (ar->result == (LONG)SCARD_E_NO_READERS_AVAILABLE)) {
         const unsigned argc = 2;
         Local<Value> argv[argc] = {
             Nan::Undefined(), // argument
@@ -143,6 +149,13 @@ void PCSCLite::HandleReaderStatusChange(uv_async_t *handle, int status) {
         const unsigned argc = 1;
         Local<Value> argv[argc] = { err };
         Nan::Callback(Nan::New(async_baton->callback)).Call(argc, argv);
+    }
+
+    // Do exit, after throwing last events
+    if (ar->do_exit) {
+        // necessary otherwise UV will block
+        uv_close(reinterpret_cast<uv_handle_t*>(&async_baton->async), CloseCallback);
+        return;
     }
 
     /* reset AsyncResult */
@@ -159,7 +172,7 @@ void PCSCLite::HandlerFunction(void* arg) {
     PCSCLite* pcsclite = async_baton->pcsclite;
     async_baton->async_result = new AsyncResult();
 
-    while (!pcsclite->m_state && (result == SCARD_S_SUCCESS)) {
+    while (!pcsclite->m_state) {
         /* Get card readers */
         result = pcsclite->get_card_readers(pcsclite, async_baton->async_result);
         if (result == (LONG)SCARD_E_NO_READERS_AVAILABLE) {
@@ -180,6 +193,7 @@ void PCSCLite::HandlerFunction(void* arg) {
                                           INFINITE,
                                           &pcsclite->m_card_reader_state,
                                           1);
+
             uv_mutex_lock(&pcsclite->m_mutex);
             if (pcsclite->m_state) {
                 uv_cond_signal(&pcsclite->m_cond);
@@ -190,9 +204,12 @@ void PCSCLite::HandlerFunction(void* arg) {
             }
 
             uv_mutex_unlock(&pcsclite->m_mutex);
-        } else {
+        } else if (result == SCARD_S_SUCCESS) {
             /*  If PnP is not supported, just wait for 1 second */
             Sleep(1000);
+        } else {
+            /* Error on last card access and no PnP, stop monitoring */
+            pcsclite->m_state = 2;
         }
     }
 
@@ -205,7 +222,12 @@ void PCSCLite::CloseCallback(uv_handle_t *handle) {
     /* cleanup process */
     AsyncBaton* async_baton = static_cast<AsyncBaton*>(handle->data);
     AsyncResult* ar = async_baton->async_result;
+#ifdef SCARD_AUTOALLOCATE
+    PCSCLite* pcsclite = async_baton->pcsclite;
+    SCardFreeMemory(pcsclite->m_card_context, ar->readers_name);
+#else
     delete [] ar->readers_name;
+#endif
     delete ar;
     async_baton->callback.Reset();
     delete async_baton;
@@ -213,31 +235,58 @@ void PCSCLite::CloseCallback(uv_handle_t *handle) {
 
 LONG PCSCLite::get_card_readers(PCSCLite* pcsclite, AsyncResult* async_result) {
 
+    DWORD readers_name_length;
+    LPTSTR readers_name;
+
     LONG result = SCARD_S_SUCCESS;
 
     /* Reset the readers_name in the baton */
     async_result->readers_name = NULL;
     async_result->readers_name_length = 0;
 
+#ifdef SCARD_AUTOALLOCATE
+    readers_name_length = SCARD_AUTOALLOCATE;
+    result = SCardListReaders(pcsclite->m_card_context,
+                              NULL,
+                              (LPTSTR)&readers_name,
+                              &readers_name_length);
+#else
     /* Find out ReaderNameLength */
-    DWORD readers_name_length;
-    result = SCardListReaders(pcsclite->m_card_context, NULL, NULL, &readers_name_length);
+    result = SCardListReaders(pcsclite->m_card_context,
+                              NULL,
+                              NULL,
+                              &readers_name_length);
     if (result != SCARD_S_SUCCESS) {
         return result;
     }
 
-    /* Allocate Memory for ReaderName  and retrieve all readers in the terminal */
-    char* readers_name  = new char[readers_name_length];
-    result = SCardListReaders(pcsclite->m_card_context, NULL, readers_name, &readers_name_length);
+    /*
+     * Allocate Memory for ReaderName and retrieve all readers in the terminal
+     */
+    readers_name = new char[readers_name_length];
+    result = SCardListReaders(pcsclite->m_card_context,
+                              NULL,
+                              readers_name,
+                              &readers_name_length);
+#endif
+
     if (result != SCARD_S_SUCCESS) {
+#ifndef SCARD_AUTOALLOCATE
         delete [] readers_name;
+#endif
         readers_name = NULL;
         readers_name_length = 0;
+#ifndef SCARD_AUTOALLOCATE
+        /* Retry in case of insufficient buffer error */
+        if (result == SCARD_E_INSUFFICIENT_BUFFER) {
+            result = get_card_readers(pcsclite, async_result);
+        }
+#endif
+    } else {
+        /* Store the readers_name in the baton */
+        async_result->readers_name = readers_name;
+        async_result->readers_name_length = readers_name_length;
     }
-
-    /* Store the readers_name in the baton */
-    async_result->readers_name = readers_name;
-    async_result->readers_name_length = readers_name_length;
 
     return result;
 }

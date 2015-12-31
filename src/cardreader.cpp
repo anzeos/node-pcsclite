@@ -68,14 +68,16 @@ CardReader::CardReader(const std::string &reader_name): m_card_context(0),
 }
 
 CardReader::~CardReader() {
-    SCardCancel(m_card_context);
-    int ret = uv_thread_join(&m_status_thread);
-    assert(ret == 0);
+    if (m_status_thread) {
+        SCardCancel(m_card_context);
+        assert(uv_thread_join(&m_status_thread) == 0);
+    }
 
     if (m_card_context) {
         SCardReleaseContext(m_card_context);
     }
 
+    uv_cond_destroy(&m_cond);
     uv_mutex_destroy(&m_mutex);
 }
 
@@ -302,20 +304,22 @@ NAN_METHOD(CardReader::Close) {
     LONG result = SCARD_S_SUCCESS;
     CardReader* obj = Nan::ObjectWrap::Unwrap<CardReader>(info.This());
 
-    uv_mutex_lock(&obj->m_mutex);
-    if (obj->m_state == 0) {
-        obj->m_state = 1;
-        do {
-            result = SCardCancel(obj->m_status_card_context);
-        } while (uv_cond_timedwait(&obj->m_cond, &obj->m_mutex, 10000000) != 0);
+    if (obj->m_status_thread) {
+        uv_mutex_lock(&obj->m_mutex);
+        if (obj->m_state == 0) {
+            int ret;
+            int times = 0;
+            obj->m_state = 1;
+            do {
+                result = SCardCancel(obj->m_status_card_context);
+                ret = uv_cond_timedwait(&obj->m_cond, &obj->m_mutex, 10000000);
+            } while ((ret != 0) && (++ times < 5));
+        }
+
+        assert(uv_thread_join(&obj->m_status_thread) == 0);
+        obj->m_status_thread = 0;
+        uv_mutex_unlock(&obj->m_mutex);
     }
-
-    assert(uv_thread_join(&obj->m_status_thread) == 0);
-    obj->m_status_thread = 0;
-
-    uv_mutex_unlock(&obj->m_mutex);
-    uv_mutex_destroy(&obj->m_mutex);
-    uv_cond_destroy(&obj->m_cond);
 
     info.GetReturnValue().Set(Nan::New<Number>(result));
 }
@@ -333,6 +337,29 @@ void CardReader::HandleReaderStatusChange(uv_async_t *handle, int status) {
 
     AsyncResult* ar = async_baton->async_result;
 
+    if (reader->m_state == 1) {
+        // Swallow events : Listening thread was cancelled by user.
+    } else if ((ar->result == SCARD_S_SUCCESS) ||
+               (ar->result == (LONG)SCARD_E_NO_READERS_AVAILABLE) ||
+               (ar->result == (LONG)SCARD_E_UNKNOWN_READER)) { // Card reader was unplugged, it's not an error
+        if (ar->status != 0) {
+            const unsigned int argc = 3;
+            Local<Value> argv[argc] = {
+                Nan::Undefined(), // argument
+                Nan::New<Number>(ar->status),
+                Nan::CopyBuffer(reinterpret_cast<char*>(ar->atr), ar->atrlen).ToLocalChecked()
+            };
+
+            Nan::Callback(Nan::New(async_baton->callback)).Call(argc, argv);
+        }
+    } else {
+        Local<Value> err = Nan::Error(error_msg("SCardGetStatusChange", ar->result).c_str());
+        // Prepare the parameters for the callback function.
+        const unsigned int argc = 1;
+        Local<Value> argv[argc] = { err };
+        Nan::Callback(Nan::New(async_baton->callback)).Call(argc, argv);
+    }
+
     if (ar->do_exit) {
         uv_close(reinterpret_cast<uv_handle_t*>(&async_baton->async), CloseCallback); // necessary otherwise UV will block
 
@@ -342,23 +369,6 @@ void CardReader::HandleReaderStatusChange(uv_async_t *handle, int status) {
         };
 
         Nan::MakeCallback(async_baton->reader->handle(), "emit", 1, argv);
-    } else {
-        if (ar->result == SCARD_S_SUCCESS) {
-            const unsigned argc = 3;
-            Local<Value> argv[argc] = {
-                Nan::Undefined(), // argument
-                Nan::New<Number>(ar->status),
-                Nan::CopyBuffer(reinterpret_cast<char*>(ar->atr), ar->atrlen).ToLocalChecked()
-            };
-
-            Nan::Callback(Nan::New(async_baton->callback)).Call(argc, argv);
-        } else {
-            Local<Value> err = Nan::Error(error_msg("SCardGetStatusChange", ar->result).c_str());
-            // Prepare the parameters for the callback function.
-            const unsigned argc = 1;
-            Local<Value> argv[argc] = { err };
-            Nan::Callback(Nan::New(async_baton->callback)).Call(argc, argv);
-        }
     }
 
     if (reader->m_status_thread) {
@@ -379,33 +389,36 @@ void CardReader::HandlerFunction(void* arg) {
     card_reader_state.szReader = reader->m_name.c_str();
     card_reader_state.dwCurrentState = SCARD_STATE_UNAWARE;
 
-    bool keep_watching(result == SCARD_S_SUCCESS);
-    while (keep_watching) {
+    while (!reader->m_state) {
 
         result = SCardGetStatusChange(reader->m_status_card_context, INFINITE, &card_reader_state, 1);
-        keep_watching = (result == SCARD_S_SUCCESS) && (!reader->m_state);
 
         uv_mutex_lock(&reader->m_mutex);
         if (reader->m_state == 1) {
+            // Exit requested by user. Notify close method about SCardStatusChange was interrupted.
             uv_cond_signal(&reader->m_cond);
-        }
-
-        if (!keep_watching) {
+        } else if (result != (LONG)SCARD_S_SUCCESS) {
+            // Exit this loop due to errors
             reader->m_state = 2;
         }
 
-        uv_mutex_unlock(&reader->m_mutex);
-
+        async_baton->async_result->do_exit = (reader->m_state != 0);
         async_baton->async_result->result = result;
-        async_baton->async_result->status = card_reader_state.dwEventState;
+        if (card_reader_state.dwEventState == card_reader_state.dwCurrentState) {
+            async_baton->async_result->status = 0;
+        } else {
+            async_baton->async_result->status = card_reader_state.dwEventState;
+        }
         memcpy(async_baton->async_result->atr, card_reader_state.rgbAtr, card_reader_state.cbAtr);
         async_baton->async_result->atrlen = card_reader_state.cbAtr;
+
+        uv_mutex_unlock(&reader->m_mutex);
+
         uv_async_send(&async_baton->async);
         card_reader_state.dwCurrentState = card_reader_state.dwEventState;
     }
 
-    async_baton->async_result->do_exit = true;
-    uv_async_send(&async_baton->async);
+    // Exit flag set in keepwatching and handled in following uv_async_send
 }
 
 void CardReader::DoConnect(uv_work_t* req) {
